@@ -919,6 +919,43 @@ sub retrieve_protein_feature_sequence {
     return \%out;
 }
 
+sub retrieve_nucleotide_feature_sequence {
+    my ( $self, $fids) = @_;
+
+    my %map;
+
+    #
+    # Query for features.
+    #
+
+    $self->query_cb("genome_feature",
+                    sub {
+                        my ($data) = @_;
+                        for my $ent (@$data) {
+                            push(@{ $map{ $ent->{na_sequence_md5} } },
+                                 $ent->{patric_id});
+                        }
+                        return 1;
+                    },
+                    [ "eq",     "feature_type", "CDS" ],
+                    [ "in",     "patric_id", "(" . join(",", map { uri_escape($_) } @$fids) . ")"],
+                    [ "select", "patric_id,na_sequence_md5" ],
+                   );
+
+    #
+    # Query for sequences.
+    #
+
+    my $seqs = $self->lookup_sequence_data_hash([keys %map]);
+
+    my %out;
+    while ( my ( $k, $v ) = each %map )
+    {
+        $out{$_} = $seqs->{$k} foreach @$v;
+    }
+    return \%out;
+}
+
 sub retrieve_protein_features_in_genome_in_export_format {
     my ( $self, $genome_id, $fasta_fh ) = @_;
 
