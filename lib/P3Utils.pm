@@ -62,6 +62,8 @@ use constant OBJECTS => {   genome => 'genome',
                             protein_structure => 'protein_structure',
                             surveillance => 'surveillance',
                             serology => 'serology',
+                            sf => 'sequence_feature',
+                            sfvt => 'sequence_feature_vt'
 };
 
 =head3 FIELDS
@@ -97,6 +99,8 @@ use constant FIELDS =>  {   genome => ['genome_name', 'genome_id', 'genome_statu
                             serology => ['sample_identifier', 'host_identifier', 'host_type', 'host_species', 'host_common_name',
                                             'host_sex', 'host_age', 'host_age_group', 'host_health', 'collection_date', 'test_type', 'test_result',
                                             'serotype'],
+                            sf => ['sf_id', 'sf_name', 'sf_category', 'gene', 'length', 'sf_category', 'start', 'end', 'source_strain' ],
+                            sfvt => ['sf_id', 'sf_name', 'sf_category', 'sfvt_id', 'sfvt_genome_count', 'sfvt_sequence'],
 };
 
 =head3 IDCOL
@@ -124,6 +128,8 @@ use constant IDCOL =>   {   genome => 'genome_id',
                             protein_structure => 'pdb_id',
                             surveillance => 'sample_identifier',
                             serology => 'sample_identifier',
+                            sf => 'sf_id',
+                            sfvt => 'id'
                         };
 
 =head3 DERIVED
@@ -813,6 +819,9 @@ sub clean_value {
     $value =~ s/^\s+//;
     $value =~ s/\s+$//;
     $value =~ s/'//;
+    if ($value =~ /^[^"].+\s/) {
+        $value = "\"$value\"";
+    }
     return $value;
 }
 
@@ -960,7 +969,7 @@ sub get_data_batch {
     my $computed = _select_list($object, $cols);
     my @mods = (['select', @keyList, @$computed], @$filter);
     # Now get the list of key values. These are not cleaned, because we are doing exact matches.
-    my @keys = grep { $_ ne '' } map { $_->[0] } @$couplets;
+    my @keys = grep { $_ ne '' } map { clean_value($_->[0]) } @$couplets;
     # Only proceed if we have at least one key.
     if (scalar @keys) {
         # Create a filter for the keys.
