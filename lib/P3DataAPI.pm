@@ -643,7 +643,7 @@ sub query_cb {
     {
         my $lim = "limit($chunk,$start)";
         my $q   = "$qstr&$lim";
-	print STDERR "$self->{url} $core $q\n";
+	# print STDERR "$self->{url} $core $q\n";
         my ($resp, $data) = $self->submit_query($core, $q);
 
         my $r = $resp->header('content-range');
@@ -1663,6 +1663,32 @@ sub retrieve_genome_metadata {
 
     $self->query_cb(
         "genome",
+        sub {
+            my ($data) = @_;
+            push( @out, @$data );
+            return 1;
+        },
+        $qry,
+        [ "select", @$keys ]
+    );
+    return @out;
+}
+
+sub retrieve_private_genome_metadata {
+    my ( $self, $genomes, $keys ) = @_;
+
+    my @out;
+
+    my $qry;
+    if ( ref($genomes) ) {
+        my $q = join( ",", @$genomes );
+        $qry = [ "in", "genome_id", "($q)" ];
+    } else {
+        $qry = [ "eq", "genome_id", $genomes ];
+    }
+
+    $self->query_cb(
+        "private_genome_metadata",
         sub {
             my ($data) = @_;
             push( @out, @$data );
