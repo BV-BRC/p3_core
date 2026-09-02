@@ -190,4 +190,69 @@ sub api_with
     is($out->{response}{numFound}, 1, "  ... returning the decoded body");
 }
 
+#
+# submit_query is the RQL path. It shares the helper now, so the contrast that
+# matters is with what it used to do on its own: fifteen retries of anything,
+# including responses that could never come back different.
+#
+
+#
+# 11. A transient failure is still survived.
+#
+{
+    my($api, $ua) = api_with(err_response(503, "Service Unavailable"), ok_response());
+    my($resp, $data) = $api->submit_query("genome", "q=*:*");
+    ok($resp && $resp->is_success, "submit_query survives a 503");
+    is($ua->attempts, 2, "  ... after one retry");
+    is($data->{response}{numFound}, 1, "  ... and hands back the decoded body");
+}
+
+#
+# 12. The 1010 wart: the old loop spent ~135s repeating a response the edge had
+#     marked retryable:false.
+#
+{
+    my($api, $ua) = api_with(err_response(403, "Forbidden",
+                                          q<{"error_code":1010,"cloudflare_error":true,"retryable":false}>,
+                                          "Content-Type" => "application/json",
+                                          "CF-Ray" => "8f00000000000000-ORD"));
+    eval { $api->submit_query("genome", "q=*:*") };
+    isnt($@, q<>, "submit_query dies on a 1010");
+    is($ua->attempts, 1, "  ... on the first attempt, no longer fifteen");
+    like($@, qr/query = /, "  ... and still reports the query text");
+}
+
+#
+# 13. A rejected query cannot become valid by being asked again.
+#
+{
+    my($api, $ua) = api_with(err_response(400, "Bad Request", "undefined field bogus"));
+    eval { $api->submit_query("genome", "q=bogus:1") };
+    like($@, qr/Failed: 400/, "submit_query dies on a 400");
+    is($ua->attempts, 1, "  ... without retrying");
+}
+
+#
+# 14. A genuine 500 from the origin is the origin struggling. Hammering it
+#     fifteen times is how a slow outage becomes a hard one.
+#
+{
+    my($api, $ua) = api_with(err_response(500, "Internal Server Error", "boom"));
+    eval { $api->submit_query("genome", "q=*:*") };
+    like($@, qr/Failed: 500/, "submit_query dies on an origin 500");
+    is($ua->attempts, 1, "  ... without retrying");
+}
+
+#
+# 15. A body that will not parse is retried rather than dying with a decode
+#     error, which is what the old loop did too -- the one retry behaviour
+#     worth keeping.
+#
+{
+    my($api, $ua) = api_with(ok_response("not json at all"), ok_response());
+    my($resp, $data) = $api->submit_query("genome", "q=*:*");
+    is($ua->attempts, 2, "submit_query retries an undecodable body");
+    is($data->{response}{numFound}, 1, "  ... and returns the good one");
+}
+
 done_testing();
