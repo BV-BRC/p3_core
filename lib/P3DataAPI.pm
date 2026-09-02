@@ -865,6 +865,68 @@ sub _solr_page_query
 # Perform a solr-encoded query.
 #
 
+#
+# POST a solr query and return the decoded response.
+#
+# Retries are delegated to P3ClientUA::retry_request rather than hand-rolled.
+# It already classifies which failures are worth repeating -- connect failures,
+# 408/429/502/503/504, with Retry-After honored upward-only -- and, more to the
+# point, which are not: a Cloudflare policy block is a decision, and the edge
+# will make the same decision again in a millisecond. It also keeps a genuine
+# 500 from the origin out of the retry path, so a struggling service does not
+# get hammered.
+#
+# Before this, these queries had no retry at all while the RQL path in
+# submit_query retried fifteen times, so which failures a caller survived
+# depended only on which entry point it happened to use. A single transient 502
+# was enough to kill an enumeration: that is how Coronaviridae -- ~380 cursor
+# pages -- became the only failure of the 2026-08 BLAST rebuild.
+#
+# Two details are load-bearing:
+#
+#   - The request comes from a factory, not from a request built once and
+#     replayed. An HTTP::Request carrying a content queue streams zero bytes
+#     under the original Content-Length on a second send.
+#
+#   - The body is decoded inside the send hook. classify_response short-circuits
+#     on is_success, so a 200 whose body is truncated or otherwise unparseable
+#     is invisible to it; converting that to a synthetic 502 is what makes a
+#     short read on a 25,000-row page retryable instead of a confusing
+#     malformed-JSON die. Decoding here also means we decode exactly once.
+#
+sub _solr_post
+{
+    my($self, $core, $form, $what) = @_;
+
+    my $uri = URI->new($self->url . "/$core");
+
+    my @headers = ("Content-type" => "application/solrquery+x-www-form-urlencoded",
+                   "Accept" => "application/solr+json",
+                   $self->auth_header);
+
+    my $decoded;
+
+    my $res = P3ClientUA::retry_request($self->ua,
+                                        sub { HTTP::Request::Common::POST($uri, $form, @headers) },
+                                        what => $what,
+                                        send => sub {
+                                            my($ua, $req) = @_;
+                                            $decoded = undef;
+                                            my $r = P3ClientUA::detect_truncated_body($ua->request($req));
+                                            return $r unless $r->is_success;
+                                            $decoded = eval { decode_json($r->content) };
+                                            return $r if defined $decoded;
+                                            return HTTP::Response->new(502, "Undecodable JSON response",
+                                                                       $r->headers->clone, $r->content);
+                                        });
+
+    return $decoded if $res->is_success && defined $decoded;
+
+    P3ClientUA::dump_http_failure($res, \*STDERR) if P3ClientUA::debug_enabled();
+    die P3ClientUA::http_failure_message($res, "Query") if P3ClientUA::is_cloudflare_block($res);
+    die "Query failed: " . $res->code . " " . $res->content;
+}
+
 sub solr_query_raw
 {
     my($self, $core, $params) = @_;
@@ -889,33 +951,15 @@ sub solr_query_raw
         print STDERR "SQ: $uri " . join(" ", map { "$_ = '$params{$_}'" } sort keys %params), "\n";
     }
     # print STDERR "Query url: $uri\n";
-    my $res = $self->ua->post($uri,
-                              \%params,
-                             "Content-type" => "application/solrquery+x-www-form-urlencoded",
-                             "Accept", "application/solr+json",
-                             $self->auth_header,
-                            );
+    my $out = $self->_solr_post($core, \%params, "solr query on $core");
     if ($self->debug)
     {
         my $e = gettimeofday;
         my $elap = $e - $s;
         print STDERR "Done elap=$elap\n";
-    }
-    if ($res->is_success)
-    {
-        my $out = decode_json($res->content);
-    if ($self->debug)
-    {
         print STDERR " solr qtime $out->{responseHeader}->{QTime}\n";
     }
-        return $out;
-    }
-    else
-    {
-        P3ClientUA::dump_http_failure($res, \*STDERR) if P3ClientUA::debug_enabled();
-        die P3ClientUA::http_failure_message($res, "Query") if P3ClientUA::is_cloudflare_block($res);
-        die "Query failed: " . $res->code . " " . $res->content;
-    }
+    return $out;
 }
 
 sub solr_query_raw_list
@@ -933,29 +977,14 @@ sub solr_query_raw_list
     }
     # print STDERR "Query url: $uri params: @$params\n";
 
-    my $res = $self->ua->post($uri,
-                              $params,
-                  "Content-type" => "application/solrquery+x-www-form-urlencoded",
-                  "Accept", "application/solr+json",
-                  $self->auth_header,
-                            );
+    my $out = $self->_solr_post($core, $params, "solr query on $core");
     if ($self->debug)
     {
         my $e = gettimeofday;
         my $elap = $e - $s;
         print STDERR "Done elap=$elap\n";
     }
-    if ($res->is_success)
-    {
-        my $out = decode_json($res->content);
-        return $out;
-    }
-    else
-    {
-        P3ClientUA::dump_http_failure($res, \*STDERR) if P3ClientUA::debug_enabled();
-        die P3ClientUA::http_failure_message($res, "Query") if P3ClientUA::is_cloudflare_block($res);
-        die "Query failed: " . $res->code . " " . $res->content;
-    }
+    return $out;
 }
 
 sub solr_query_raw_multi
