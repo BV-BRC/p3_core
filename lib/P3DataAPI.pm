@@ -609,6 +609,18 @@ sub _cursor_enabled
 # Memoized per core on the object, so a paging loop costs at most one extra
 # request.
 #
+# The fetch goes through P3ClientUA::retry_request for the same reason the query
+# paths do, and the case for it here is stronger rather than weaker. This is a
+# prerequisite of every cursor query, so an unretried transient turns a blip on a
+# ~200-byte metadata GET into the failure of whatever the caller was doing: a
+# single 502 here aborted a completed 217-genome BLAST database build
+# (Tectiviridae, 2026-09-02) after all of its real work was done. A GET of a
+# schema is idempotent, so we do not pass idempotent_only -- a MAYBE_SENT
+# response is safe to replay.
+#
+# "Cannot discover the key" therefore means the endpoint stayed unreachable for
+# the whole retry budget, not that one request happened to fail.
+#
 sub _unique_key_for_core
 {
     my($self, $core) = @_;
@@ -617,7 +629,10 @@ sub _unique_key_for_core
     return $cache->{$core} if defined $cache->{$core};
 
     my $url = $self->{url} . "/$core/schema";
-    my $res = $self->ua->get($url, Accept => "application/json");
+    my $res = P3ClientUA::retry_request($self->ua,
+                                        sub { HTTP::Request::Common::GET($url,
+                                                                         Accept => "application/json") },
+                                        what => "schema lookup on $core");
 
     $res->is_success
         or die "P3DataAPI: cannot determine the uniqueKey for core '$core' " .
