@@ -319,11 +319,9 @@ sub query
 {
     my ( $self, $core, @query ) = @_;
 
-    my $qstr;
-    my $started;
+    my @q;
     my $limitFound;
 
-    my @q;
     for my $ent (@query) {
         my ( $k, @vals ) = @$ent;
         if ( @vals == 1 && ref( $vals[0] ) ) {
@@ -336,77 +334,28 @@ sub query
             push( @q, $qe );
         }
     }
-    $qstr = join( "&", @q );
 
-    my $url   = $self->{url} . "/$core";
-    my $ua    = $self->{ua};
-    my $done  = 0;
-    my $chunk = $self->{chunk_size};
-    my $start = 0;
+    #
+    # A caller-coded limit() overrides everything: it is a single request, so
+    # there is no paging to stabilize and no cursor involved.
+    #
+    if ($limitFound)
+    {
+        return () if (defined $self->{limit} && $self->{limit} <= 0);
+
+        my $q = join("&", @q, "limit($limitFound,0)");
+        $q = $self->url_encode($q) if (! $self->{raw});
+        $q =~ s/ /%20/g;
+
+        my ($resp, $data) = $self->submit_query($core, $q);
+        $self->{limit} -= scalar @$data if (defined $self->{limit});
+        return @$data;
+    }
 
     my @result;
-    while ( !$done) {
-        my $lim;
-        # Compute the limit clause. A coded limit overrides everything. Otherwise, the hard limit is
-        # checked. The maximum limit is the chunk size. If $start is nonzero, then we are getting
-        # a chunk on a secondary call. If the hard limit is zero, we are done.
-        if (defined $self->{limit} && $self->{limit} <= 0) {
-			$done = 1;
-		} else {
-	        if ($limitFound) {
-				# Here we have a limit override.
-				$lim = "limit($limitFound,0)";
-				$done = 1;
-			} elsif (! defined $self->{limit}) {
-				# No hard limit, so get a chunk.
-				$lim = "limit($chunk,$start)";
-			} else {
-				# Here we have a hard limit. This could reduce the chunk size.
-				my $computed_lim = $chunk;
-				if ($computed_lim > $self->{limit}) {
-					$computed_lim = $self->{limit};
-				}
-				$lim = "limit($computed_lim,$start)";
-			}
-		    my $q   = "$qstr&$lim";
-
-	        #       print STDERR "Qry $url '$q'\n";
-	        #	my $resp = $ua->post($url,
-	        #			     Accept => "application/json",
-	        #			     Content => $q);
-	        my $end;
-	        # Form url-encoding
-	        if (! $self->{raw}) {
-	            $q = $self->url_encode($q);
-	        }
-	        $q =~ s/ /%20/g;
-	        # POST query - we retry 5 times after error
-	        my ($resp, $data) = $self->submit_query($core, $q);
-	        # print STDERR $resp->content;
-
-	        push @result, @$data;
-	        # Update the hard limit, if needed.
-	        if (defined $self->{limit}) {
-				$self->{limit} -= scalar @$data;
-			}
-
-	        #        print STDERR scalar(@$data) . " results found.\n";
-	        # Do the chunking here. We use the content range to figure out
-	        # if another chunk is needed.
-	        my $r = $resp->header('content-range');
-	        #	print "r=$r\n";
-	        if ( $r =~ m,items\s+(\d+)-(\d+)/(\d+), ) {
-	            my $this_start = $1;
-	            my $next       = $2;
-	            my $count      = $3;
-	            if (! $started && $count >= 500) {
-	                $started = 1;
-	            }
-	            last if ( $next >= $count );
-	            $start = $next;
-	        }
-		}
-    }
+    $self->_page_query($core, \@q,
+                       { encode => 1, space => '%20', hard_limit => 1 },
+                       sub { push(@result, @{$_[0]}); return 1; });
     return @result;
 }
 
@@ -417,49 +366,10 @@ sub raw_query
 {
     my ( $self, $core, @query ) = @_;
 
-    my $started;
-    my $url   = $self->{url} . "/$core";
-    my $ua    = $self->{ua};
-    my $done  = 0;
-    my $chunk = $self->{chunk_size};
-    my $start = 0;
-
     my @result;
-    while ( !$done ) {
-        my $q   = join("&", "limit($chunk,$start)", @query);
-
-        #       print STDERR "Qry $url '$q'\n";
-        #	my $resp = $ua->post($url,
-        #			     Accept => "application/json",
-        #			     Content => $q);
-        my $end;
-        # Form url-encoding
-        if (! $self->{raw}) {
-            $q = $self->url_encode($q);
-        }
-        $q =~ s/ /+/g;
-        # POST query - we retry 5 times after error
-        my ($resp, $data) = $self->submit_query($core, $q);
-        # print STDERR $resp->content;
-
-        push @result, @$data;
-
-        #        print STDERR scalar(@$data) . " results found.\n";
-        my $r = $resp->header('content-range');
-
-            print "r=$r\n";
-        if ( $r =~ m,items\s+(\d+)-(\d+)/(\d+), ) {
-            my $this_start = $1;
-            my $next       = $2;
-            my $count      = $3;
-            if (! $started && $count >= 500) {
-                # $self->_log("$count results expected.\n");
-                $started = 1;
-            }
-            last if ( $next >= $count );
-            $start = $next;
-        }
-    }
+    $self->_page_query($core, [ @query ],
+                       { encode => 1, space => '+' },
+                       sub { push(@result, @{$_[0]}); return 1; });
     return @result;
 }
 
@@ -616,8 +526,6 @@ ignored during string matches.
 sub query_cb {
     my ( $self, $core, $cb_add, @query ) = @_;
 
-    my $qstr;
-
     my @q;
     for my $ent (@query)
     {
@@ -630,48 +538,327 @@ sub query_cb {
         my $qe = "$k(" . join(",", @vals) . ")";
         push(@q, $qe);
     }
-    $qstr = join("&", @q);
 
-    my $url   = $self->{url} . "/$core";
-    my $ua    = $self->{ua};
-    my $done  = 0;
-    my $chunk = $self->{chunk_size};
-    my $start = 0;
+    #
+    # encode => 0: query_cb has never run its clauses through url_encode, and
+    # %EncodeMap is lossy enough (see _add_cursor_sort_rql) that turning it on
+    # here would be a behaviour change for all 30-odd call sites. The cursor
+    # mark is escaped separately by _cursor_clause, so it is safe either way.
+    #
+    $self->_page_query($core, \@q, { encode => 0 },
+                       sub { return $cb_add->($_[0], $_[1]); });
+}
+#
+# ---------------------------------------------------------------------------
+# Cursor-based paging
+# ---------------------------------------------------------------------------
+#
+# Deep paging (RQL limit(n,start), Solr start/rows) is unstable on a large
+# result set that has no total ordering. Solr is free to return matching
+# documents in a different order for each request, so consecutive pages
+# overlap: some documents come back twice and an equal number are never seen
+# at all. Nothing about this is visible to the caller -- every request
+# succeeds and the total row count looks right.
+#
+# It corrupted the BLAST database builds, where a genome returned twice has
+# its features fetched twice, the duplicate FASTA seqids make makeblastdb
+# -parse_seqids reject the database, and the genomes that were dropped are
+# simply missing. Measured on the Poxviridae genome query (31,901 rows): one
+# run in three returned 114 duplicates and lost 114 genomes.
+#
+# Cursor paging is stable, but it requires a sort whose final component is the
+# core's uniqueKey. We discover that key from the API rather than carrying a
+# hardcoded table, and die if we cannot find it -- silently falling back to
+# offset paging would reintroduce exactly the corruption this replaces.
+#
+# Set P3_DISABLE_CURSOR=1 to force the old offset behaviour.
+#
 
-    my @result;
-    while (!$done)
+sub _cursor_enabled
+{
+    my($self) = @_;
+    return $ENV{P3_DISABLE_CURSOR} ? 0 : 1;
+}
+
+#
+# The uniqueKey field for $core, as reported by the data API schema endpoint.
+# Memoized per core on the object, so a paging loop costs at most one extra
+# request.
+#
+sub _unique_key_for_core
+{
+    my($self, $core) = @_;
+
+    my $cache = $self->{_unique_key} ||= {};
+    return $cache->{$core} if defined $cache->{$core};
+
+    my $url = $self->{url} . "/$core/schema";
+    my $res = $self->ua->get($url, Accept => "application/json");
+
+    $res->is_success
+        or die "P3DataAPI: cannot determine the uniqueKey for core '$core' " .
+               "(GET $url: " . $res->status_line . "). A cursor query needs it as " .
+               "a sort tie-breaker, and falling back to deep paging would risk " .
+               "silently duplicated and dropped rows.\n";
+
+    my $doc = eval { decode_json($res->content) };
+    my $key = (ref($doc) eq 'HASH') ? $doc->{schema}->{uniqueKey} : undef;
+
+    $key
+        or die "P3DataAPI: core '$core' reports no uniqueKey in its schema at $url. " .
+               "A cursor query needs it as a sort tie-breaker, and falling back to " .
+               "deep paging would risk silently duplicated and dropped rows.\n";
+
+    return $cache->{$core} = $key;
+}
+
+#
+# Rewrite an RQL clause list in place so that it carries a sort ending in the
+# core's uniqueKey, which is what makes the cursor stable.
+#
+# On the leading "+": RQL spells ascending as either "+field" or a bare
+# "field" and treats them identically (verified against the live API -- both
+# yield the same cursor mark). We emit the bare form, and strip any "+" the
+# caller supplied, because url_encode's %EncodeMap maps "+" to "%43" -- a
+# percent sign followed by the *decimal* character code rather than hex -- so
+# an encoded "sort(+genome_id)" arrives as "sort(Cgenome_id)" and the request
+# 400s. Descending "-field" is unaffected and passes through untouched.
+#
+sub _add_cursor_sort_rql
+{
+    my($self, $core, $clauses) = @_;
+
+    my $key = $self->_unique_key_for_core($core);
+
+    for my $c (@$clauses)
     {
-        my $lim = "limit($chunk,$start)";
-        my $q   = "$qstr&$lim";
-	# print STDERR "$self->{url} $core $q\n";
+        next unless $c =~ /^sort\((.*)\)$/;
+
+        my @f = grep { /\S/ } split(/,/, $1);
+        s/^\+// for @f;
+        push(@f, $key) unless (grep { $_ eq $key || $_ eq "-$key" } @f);
+        $c = "sort(" . join(",", @f) . ")";
+        return;
+    }
+
+    #
+    # No caller sort, so we are choosing the whole ordering: the uniqueKey alone.
+    #
+    # It is tempting to put "-score" in front of it, because an unsorted Solr
+    # query comes back in descending score order and that is what callers who
+    # never asked for a sort have always received -- ordering by id instead
+    # turns "the 10 best matches for this keyword" into "the 10 lowest ids that
+    # match it". Do not: score is a computed pseudo-field, not an indexed one,
+    # so it cannot anchor a resumable cursor. Measured on keyword=coli
+    # (numFound 134458, 5k rows/page), sort(-score,genome_id) returned 130685
+    # rows with 21203 duplicates -- i.e. it reintroduces exactly the deep-paging
+    # instability the cursor exists to fix -- while sort(genome_id) returns
+    # 134458/134458 with none. Stable paging wins over relevance ordering.
+    #
+    push(@$clauses, "sort($key)");
+}
+
+#
+# Render a cursor clause. The mark is base64 and so may contain "+" and "/";
+# it has to be appended *after* url_encode, whose %EncodeMap would mangle
+# both, and percent-escaped here instead. The API percent-decodes the request
+# body, so this round-trips (verified live).
+#
+sub _cursor_clause
+{
+    my($self, $mark) = @_;
+    return "cursor(" . uri_escape($mark, '^A-Za-z0-9\-_.~') . ")";
+}
+
+#
+# Shared paging loop for the RQL dialect, used by query, raw_query and
+# query_cb. $clauses is the list of RQL clause strings; $per_page is called
+# with ($data, $info) for each page and returns false to stop early, matching
+# the query_cb contract.
+#
+# $opts:
+#   encode      - run the query through url_encode (off for query_cb, which
+#                 has never encoded and whose callers rely on that)
+#   space       - what to replace a literal space with, or undef to leave it
+#   hard_limit  - honour and decrement $self->{limit}
+#
+sub _page_query
+{
+    my($self, $core, $clauses, $opts, $per_page) = @_;
+
+    my $cursor = $self->_cursor_enabled;
+    my $chunk  = $self->{chunk_size};
+
+    $self->_add_cursor_sort_rql($core, $clauses) if $cursor;
+
+    my $base = join("&", @$clauses);
+
+    my $mark   = '*';
+    my $start  = 0;    # rows delivered before the current page
+    my $offset = 0;    # deep-paging offset, when the cursor is disabled
+
+    while (1)
+    {
+        my $page = $chunk;
+        if ($opts->{hard_limit} && defined $self->{limit})
+        {
+            last if $self->{limit} <= 0;
+            $page = $self->{limit} if $self->{limit} < $page;
+        }
+
+        my $q = $base . "&limit(" . $page . ($cursor ? "" : ",$offset") . ")";
+        $q = $self->url_encode($q) if (! $self->{raw} && $opts->{encode});
+        $q =~ s/ /$opts->{space}/g if defined $opts->{space};
+        $q .= "&" . $self->_cursor_clause($mark) if $cursor;
+
         my ($resp, $data) = $self->submit_query($core, $q);
+        my $ndocs = scalar @$data;
+
+        $self->{limit} -= $ndocs if ($opts->{hard_limit} && defined $self->{limit});
 
         my $r = $resp->header('content-range');
-
-        if ($r =~ m,items\s+(\d+)-(\d+)/(\d+),)
+        my $count;
+        if (defined($r) && $r =~ m,items\s+(\d+)-(\d+)/(\d+),)
         {
-            my $this_start = $1;
-            my $next       = $2;
-            my $count      = $3;
-
-            my $last_call = ($next >= $count ? 1 : 0);
-
-            my $continue = $cb_add->($data,
-                         {
-                             start => $this_start,
-                             next => $next,
-                             count => $count,
-                             last_call => ($last_call ? 1 : 0),
-                         });
-
-            last if (!$continue || $last_call);
-            $start = $next;
+            $count = $3;
         }
-        else
+        elsif (! $cursor)
         {
             die "Could not parse content-range header '$r'\n";
         }
+
+        my $next = $start + $ndocs;
+
+        my $next_mark;
+        if ($cursor)
+        {
+            $next_mark = $resp->header('X-Cursor-Mark');
+            defined($next_mark)
+                or die "P3DataAPI: cursor query to core '$core' returned no " .
+                       "X-Cursor-Mark header; cannot page safely.\n";
+        }
+
+        #
+        # Termination. Under the cursor we stop on a short page -- Solr returns
+        # exactly `rows` documents until the result set is exhausted -- with the
+        # unchanged mark as a backstop. We deliberately do *not* stop on
+        # numFound: it can move under a live index, and stopping early there is
+        # how rows go missing. Under offset paging, numFound is all we have.
+        #
+        my $last_call = 0;
+        if ($cursor)
+        {
+            $last_call = 1 if ($ndocs < $page || $ndocs == 0 || $next_mark eq $mark);
+        }
+        else
+        {
+            $last_call = 1 if (defined($count) && $next >= $count);
+            $last_call = 1 if ($ndocs == 0);
+        }
+        $last_call = 1 if ($opts->{hard_limit} && defined $self->{limit} && $self->{limit} <= 0);
+
+        my $continue = $per_page->($data,
+                                   {
+                                       start     => $start,
+                                       next      => $next,
+                                       count     => (defined($count) ? $count : $next),
+                                       last_call => $last_call,
+                                   });
+
+        last if (!$continue || $last_call);
+
+        $start  = $next;
+        $offset = $next;
+        $mark   = $next_mark if $cursor;
     }
+}
+
+#
+# Shared cursor paging for the Solr dialect, used by solr_query and
+# solr_query_list. $params is a flat (k, v, ...) list -- what
+# solr_query_raw_list takes, and what a params hash flattens to. $issue
+# performs one request given such a list.
+#
+sub _solr_page_query
+{
+    my($self, $core, $params, $max_count, $cb, $issue) = @_;
+
+    my $cursor     = $self->_cursor_enabled;
+    my $block_size = 25000;
+
+    #
+    # Strip the paging controls; this routine owns them. The caller's sort is
+    # kept and extended, not discarded.
+    #
+    my @base;
+    my $sort;
+    for (my $i = 0; $i < @$params; $i += 2)
+    {
+        my($k, $v) = @{$params}[$i, $i + 1];
+        if ($k eq 'sort') { $sort = $v; next; }
+        next if ($k eq 'start' || $k eq 'rows' || $k eq 'cursorMark');
+        push(@base, $k, $v);
+    }
+
+    if ($cursor)
+    {
+        my $key = $self->_unique_key_for_core($core);
+        my @f = grep { /\S/ } split(/\s*,\s*/, (defined($sort) ? $sort : ''));
+        push(@f, "$key asc") unless (grep { /^\Q$key\E(?:\s|$)/ } @f);
+        $sort = join(",", @f);
+    }
+
+    my $n     = 0;
+    my $mark  = '*';
+    my $start = 0;
+    my @out;
+
+    while (1)
+    {
+        my $rows = $block_size;
+        $rows = $max_count - $n if (defined($max_count) && $max_count - $n < $rows);
+        last if $rows <= 0;
+
+        my @p = @base;
+        push(@p, sort => $sort) if (defined($sort) && $sort ne '');
+        push(@p, rows => $rows);
+        push(@p, $cursor ? (cursorMark => $mark) : (start => $start));
+
+        my $doc = $issue->(\@p);
+        ref($doc) eq 'HASH' or die "solr query failed: " . Dumper($doc, $params);
+
+        my $resp  = $doc->{response};
+        my $ndocs = @{$resp->{docs}};
+        $n += $ndocs;
+
+        if (ref($cb))
+        {
+            push(@out, $cb->($doc));
+        }
+        else
+        {
+            push(@out, @{$resp->{docs}});
+        }
+
+        last if (defined($max_count) && $n >= $max_count);
+
+        if ($cursor)
+        {
+            my $next = $doc->{nextCursorMark};
+            defined($next)
+                or die "P3DataAPI: cursor query to core '$core' returned no " .
+                       "nextCursorMark; cannot page safely.\n";
+            last if ($next eq $mark || $ndocs == 0 || $ndocs < $rows);
+            $mark = $next;
+        }
+        else
+        {
+            $start += $ndocs;
+            last if ($ndocs == 0 || $n >= $resp->{numFound});
+        }
+    }
+
+    return \@out;
 }
 
 #
@@ -875,27 +1062,8 @@ sub solr_query
 {
     my($self, $core, $params, $max_count) = @_;
 
-    my $start = 0;
-    my $block_size = 25000;
-    my $count = (!defined($max_count) || $max_count > $block_size) ? $block_size : $max_count;
-
-    my $n = 0;
-    my @out;
-    while (1)
-    {
-        my $doc = $self->solr_query_raw($core, { %$params, start => $start, rows => $count });
-        ref($doc) eq 'HASH' or die "solr query failed: " . Dumper($doc, $params);
-        my $resp = $doc->{response};
-        my $ndocs = @{$resp->{docs}};
-        $n += $ndocs;
-
-        # print STDERR "ndocs=$ndocs $n=$n nfound=$resp->{numFound}\n";
-        push(@out, @{$resp->{docs}});
-
-        $start += $ndocs;
-        last if (defined($max_count) && $n >= $max_count) || $n >= $resp->{numFound};
-    }
-    return \@out;
+    return $self->_solr_page_query($core, [ %$params ], $max_count, undef,
+                                   sub { $self->solr_query_raw($core, { @{$_[0]} }) });
 }
 
 #
@@ -906,35 +1074,8 @@ sub solr_query_list
 {
     my($self, $core, $params, $max_count, $cb) = @_;
 
-    my $start = 0;
-    my $block_size = 25000;
-    my $count = (!defined($max_count) || $max_count > $block_size) ? $block_size : $max_count;
-
-    my $n = 0;
-    my @out;
-    while (1)
-    {
-        my $doc = $self->solr_query_raw_list($core, [ @$params, start => $start, rows => $count ]);
-        ref($doc) eq 'HASH' or die "solr query failed: " . Dumper($doc, $params);
-        my $resp = $doc->{response};
-        my $ndocs = @{$resp->{docs}};
-        $n += $ndocs;
-
-        # print STDERR "ndocs=$ndocs $n=$n nfound=$resp->{numFound}\n";
-
-    if (ref($cb))
-    {
-        push(@out, $cb->($doc));
-    }
-    else
-    {
-        push(@out, @{$resp->{docs}});
-    }
-
-        $start += $ndocs;
-        last if (defined($max_count) && $n >= $max_count) || $n >= $resp->{numFound};
-    }
-    return \@out;
+    return $self->_solr_page_query($core, $params, $max_count, $cb,
+                                   sub { $self->solr_query_raw_list($core, $_[0]) });
 }
 
 sub retrieve_contigs_in_genomes {
