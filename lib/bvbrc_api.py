@@ -11,11 +11,9 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 Debug = False #shared across functions defined here
 LOG = sys.stderr
-Base_url = "https://www.patricbrc.org/api/"
+Base_url = "https://www.bv-brc.org/api-internal/"
 
 PatricUser = None
-
-
 
 # First iteration: include getFeatureDataFrame, getSubsystemsDataFrame, getPathwayDataFrame, authenticate functions and getGenomeGroupIds
 
@@ -45,14 +43,17 @@ def getQueryDataText(base, query, headers, print_query = True):
                 r.encoding = "utf-8"
             if not r.ok:
                 sys.stderr.write("Error in API request \n")
-                return None
             #for line in r.iter_lines(decode_unicode=True):
             #    yield line
             return r.text
 
 # Given a set of genome_ids, returns a pandas dataframe after querying for features
 def getFeatureDataFrame(genome_ids, session, limit=2500000):
-    dtype_dict = {'Genome ID':str,'PATRIC genus-specific families (PLfams)':'category','PATRIC cross-genus families (PGfams)':'category'}
+    dtype_dict = {'genome_id': str,
+                  'PATRIC genus-specific families (PLfams)':'category',
+                  'PATRIC cross-genus families (PGfams)':'category',
+                  'plfam_id': 'category',
+                  'pgfam_id': 'category'}
     feature_df_list = []
     limit = "limit({0})".format(limit)
     for gids in chunker(genome_ids, 20):
@@ -75,7 +76,7 @@ def getFeatureDataFrame(genome_ids, session, limit=2500000):
                 line = line+'\n'
                 batch+=line
                 batch_count+=1        
-        # XXX: set column data types
+        # TODO: set column data types
         if batch == '':
             continue
         feature_df = pd.read_csv(io.StringIO(batch),sep='\t',dtype=dtype_dict)
@@ -94,7 +95,7 @@ def getSubsystemsDataFrame(genome_ids,session,limit=2500000):
         batch=""
         genomes = "in(genome_id,({0}))".format(','.join(gids))
         select = "sort(+id)"
-        base = "https://www.bv-brc.org/api/subsystem/?http_download=true"
+        base = "https://alpha.bv-brc.org/api/subsystem/?http_download=true"
         query = "&".join([genomes,limit,select])
         headers = {"accept":"text/tsv", "content-type":"application/rqlquery+x-www-form-urlencoded", 'Authorization': session.headers['Authorization']}
         #subsystem_query = requests.get(f"https://patricbrc.org/api/subsystem/?in(genome_id,({','.join(gids)}))&limit({limit})&sort(+genome_id)&http_accept=text/tsv")
@@ -131,7 +132,7 @@ def getPathwayDataFrame(genome_ids,session,limit=2500000):
         genomes = "in(genome_id,({0}))".format(','.join(gids))
         limit_str = "limit({0})".format(limit)
         select = "eq(annotation,PATRIC)&sort(+id)"
-        base = "https://www.bv-brc.org/api/pathway/?http_download=true"
+        base = "https://alpha.bv-brc.org/api/pathway/?http_download=true"
         query = "&".join([genomes,limit_str,select])
         headers = {"accept":"text/tsv", "content-type":"application/rqlquery+x-www-form-urlencoded", 'Authorization': session.headers['Authorization']}
 
@@ -146,7 +147,7 @@ def getPathwayDataFrame(genome_ids,session,limit=2500000):
                 line = line+'\n'
                 batch+=line
                 batch_count+=1 
-        # XXX: set column data types
+        # TODO: set column data types
         if batch == '':
             continue
         pathway_df = pd.read_csv(io.StringIO(batch),sep='\t',dtype={'genome_id':str,'pathway_id':str})
@@ -200,14 +201,9 @@ def getGenomeIdsByGenomeGroup(genomeGroupName, Session, genomeGroupPath=False):
     query += "&select(genome_id)"
     query += "&limit(10000)"
     ret = Session.get(Base_url+"genome/", params=query)
-    try:
-        data = json.loads(ret.text) 
-        ret_ids = [list(x.values())[0] for x in data]
-        return ret_ids
-    except Exception as e:
-        sys.stderr.write(f'Error getting genome ids from {genomeGroupName}:\n{e}\n')
-        sys.stderr.write(f'Dumping received json:\n{ret.text}\n')
-        return None
+    data = json.loads(ret.text) 
+    ret_ids = [list(x.values())[0] for x in data]
+    return ret_ids
 
 # Returns a list of genome_ids from the passed in genus 
 def getGenomeDataFrameByGenus(genus, Session, limit=50000):
@@ -291,10 +287,10 @@ def getDataForGenomes(genomeIdSet, Session):
                 line = line+'\n'
                 batch+=line
                 batch_count+=1 
-        # XXX: rename columns
+        # TODO: rename columns
         if batch == '':
             continue 
-        genomes_df = pd.read_csv(io.StringIO(batch),sep='\t',dtype={'Genome ID':str})
+        genomes_df = pd.read_csv(io.StringIO(batch),sep='\t',dtype={'genome_id':str})
         genome_df_list.append(genomes_df)
     if len(genome_df_list) > 0:
         return_df = pd.concat(genome_df_list)
