@@ -1250,54 +1250,73 @@ boolean clause per value, so on a few thousand values the clause tree becomes
 the dominant cost of the query and can hit C<maxBooleanClauses>. For an ID
 lookup there is no ranking to lose by moving out of C<&q=>.
 
-B<It defaults to C<in>, for two independent reasons measured 2026-09-03.>
-
-B<1. Production does not implement the operator.>
+B<It defaults to C<in> for one reason: production does not implement the
+operator.> Measured 2026-09-03:
 
     www.bv-brc.org/api                 terms -> 400   in -> 200
     p3.theseed.org/services/data_api   terms -> 400   in -> 200
     alpha.bv-brc.org/api               terms -> 200   in -> 200
 
-The failure is not a clean "unknown operator" -- Solr answers
-C<{"msg":"undefined field object","code":400}>, because the older parser
-mangles the clause rather than rejecting it. C<www.bv-brc.org/api> is this
-module's default url, so defaulting to C<terms> would break every caller
-against production.
+The failure is not a clean "unknown operator" -- the older parser mangles the
+clause rather than rejecting it, so what comes back is a Solr exception
+(C<"A Database Error Occured">, C<org.apache.solr.common.SolrException>; an
+earlier build phrased it C<{"msg":"undefined field object","code":400}>).
+C<www.bv-brc.org/api> is this module's default url, so defaulting to C<terms>
+would break every caller against production.
 
-B<2. Where it is implemented, it truncates on C<genome_feature>.> On alpha,
-C<terms> plus a C<limit> of 10,000 or more returns B<HTTP 200 with a one-byte
-body> (C<"[">) whenever the result set is exhausted before the limit -- a
-truncated stream reported as success. Bisected exactly:
+B<Everything else that blocked it has been fixed.> Alpha carried two further
+defects earlier on 2026-09-03; both were resolved by an API update the same day,
+and this POD records them because they are what the tests next door are shaped
+to catch.
 
-    genome_feature  terms  250 ids  limit(9999)   -> 200, 250 rows
-    genome_feature  terms  250 ids  limit(10000)  -> 200, 1 byte, TRUNCATED
-    genome_feature  in     250 ids  limit(25000)  -> 200, 250 rows
-    genome_feature  terms  250 gids limit(25000)  -> 200, 25000 rows   (full page, fine)
-    feature_sequence terms 1489 md5 limit(25000)  -> 200, 1489 rows    (core unaffected)
+B<Was: truncation on C<genome_feature>.> C<terms> plus a C<limit> of 10,000 or
+more returned B<HTTP 200 with a one-byte body> (C<"[">) whenever the result set
+was exhausted before the limit -- a truncated stream reported as success.
+C<chunk_size> is 25,000, so every paged C<genome_feature> query hit it. Now
+clean: C<limit(250|9999|10000|25000)> all return the full 250 rows, and
+C<t/client-tests/p3-rql-terms.t> passes 10/10 against alpha where it previously
+failed 3.
 
-C<chunk_size> is 25,000, so every paged C<genome_feature> query hits this. The
-one saving grace is that it is not silent through this module: the GET path
-gets a 502 and C<submit_query> dies, rather than a short read being taken for
-an empty result. Do not rely on that -- the POST path really does return a
-successful-looking truncated body.
+B<Was: slower than C<in>, and worst in the shape this module sends.> The id list
+moving to C<&fq=> left whatever else was in the query as the scored clause, so a
+low-selectivity companion clause became the dominant cost. Same 6,053
+C<patric_id>s, before the fix:
 
-Verified by call site against alpha, C<in> vs C<terms>, same process:
+    terms, id list alone                             0.86x   (a small win)
+    terms, id list + in(feature_type,(mat_peptide,CDS))
+                                                     1.65x   (a large loss)
 
-    retrieve_genome_metadata            30 rows    identical
-    lookup_sequence_data (aa)         1489 rows    identical, 1.95s -> 0.97s
-    lookup_sequence_data (na)         1490 rows    identical, 2.23s -> 1.60s
-    retrieve_ssu_rnas                    0 rows    identical
-    retrieve_protein_feature_sequence          terms died (502 after 300s)
-    retrieve_nucleotide_feature_sequence       terms died (502 after 289s)
+That second shape is what C<retrieve_protein_feature_sequence> and
+C<retrieve_nucleotide_feature_sequence> send, and it made the former 1.93x
+slower end to end. After the fix the companion clause costs almost nothing
+(0.35x alone, 0.41x with it) and that call measures 0.79x.
 
-So the operator is semantically correct -- the C<feature_sequence> md5 lookup
-that wedged the BLAST build agrees row for row and runs about twice as fast --
-and the two failures are the server bug above, not a semantic difference.
+Current numbers on alpha, C<terms>/C<in>, below 1 meaning C<terms> is faster --
+row counts identical at every size:
 
-Flip the default here once production serves a C<rql.js> new enough to collect
-the clause (C<lib/solrjs/rql.js:474>) and emit it (C<:108>), B<and> the
-C<genome_feature> truncation is fixed. Re-run C<t/client-tests/p3-rql-terms.t>
-against the target deployment before flipping.
+    n         genome_feature    feature_sequence
+    100                0.40x               0.49x
+    500                0.48x               0.82x
+    1500               0.39x               0.75x
+    5000               0.39x               0.82x
+    15000              0.90x               0.85x
+
+By call site, same process:
+
+    retrieve_genome_metadata              30 rows   identical
+    retrieve_protein_feature_sequence   1494 rows   identical, 3.12s -> 2.56s
+    retrieve_nucleotide_feature_sequence 1494 rows  identical, 4.27s -> 2.64s
+    lookup_sequence_data (aa)           1489 rows   identical, 1.54s -> 1.15s
+    lookup_sequence_data (na)           1490 rows   identical, 2.53s -> 1.19s
+    retrieve_ssu_rnas                      0 rows   identical
+
+So the operator is both semantically correct and uniformly faster where it is
+deployed. Flip the default here once production serves a C<rql.js> new enough to
+collect the clause (C<lib/solrjs/rql.js:474>) and emit it (C<:108>). Re-run
+C<t/client-tests/p3-rql-terms.t> against the target deployment before flipping;
+C<t/client-tests/p3-rql-terms-bench.pl> is the timing counterpart, and its
+co-occurring-clause case is the one that would catch a regression of the second
+defect above.
 
 B<Only valid for literal value lists.> Do not route the subquery forms
 (C<in(feature_id,FeatureGroup(/path))>, C<in(genome_id,GenomeGroup(/path))>) or

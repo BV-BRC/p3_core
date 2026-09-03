@@ -5,7 +5,7 @@
 # filter query -- where in(f,(a,b,c)) emits f:(a OR b OR c), one scored boolean
 # clause per value. For the large literal id lists this module sends, terms() is
 # the operator we want; P3DataAPI::id_list_op() picks between them and defaults
-# to in() because as of 2026-09-03 no deployment can be trusted with terms().
+# to in() because as of 2026-09-03 production still answers terms() with a 400.
 #
 # This test is the evidence for that default. It is a live network test against
 # a deployment you name, and is skipped unless you name one:
@@ -17,9 +17,13 @@
 #   1. Does the endpoint implement terms() at all? (production: no, HTTP 400)
 #   2. Does terms() return exactly what in() returns, per affected call site?
 #   3. Does terms() survive this module's real chunk_size on genome_feature?
-#      (alpha: no -- limit >= 10000 truncates to a one-byte 200)
 #
-# All three must pass before flipping the default in id_list_op().
+# All three must pass before flipping the default in id_list_op(). As of the
+# 2026-09-03 API update, alpha passes 10/10 -- questions 2 and 3 both used to
+# fail there, so a regression is what these are now guarding against rather than
+# a known-bad state they are documenting.
+#
+# Correctness only. The timing counterpart is p3-rql-terms-bench.pl next door.
 #
 
 use strict;
@@ -190,11 +194,14 @@ compare("lookup_sequence_data (na)" => sub {
 #
 # Question 3: the genome_feature truncation.
 #
-# On alpha, terms() with a limit at or above 10,000 returns a one-byte body
-# ("[") under a 200 whenever the match is exhausted before the limit. chunk_size
-# is 25,000, so a paged genome_feature query hits it every time. Drive it through
-# query_cb at the real chunk size rather than a small one, because a small limit
-# hides the bug entirely.
+# Alpha used to return a one-byte body ("[") under a 200 for terms() with a
+# limit at or above 10,000, whenever the match was exhausted before the limit --
+# a short read presented as success. chunk_size is 25,000, so a paged
+# genome_feature query hit it every time. Fixed by the 2026-09-03 API update.
+#
+# Drive it through query_cb at the real chunk size rather than a small one: a
+# small limit hid the bug entirely, which is why it survived the first round of
+# testing.
 #
 for my $mode (qw(in terms))
 {
