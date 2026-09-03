@@ -255,4 +255,93 @@ sub api_with
     is($data->{response}{numFound}, 1, "  ... and returns the good one");
 }
 
+#
+# The schema lookup behind cursor paging. It is a prerequisite of every cursor
+# query, so an unretried transient here fails whatever the caller was doing --
+# a single 502 on this ~200-byte GET aborted a completed 217-genome BLAST
+# database build (Tectiviridae, 2026-09-02) after all its real work was done.
+#
+
+sub schema_response
+{
+    my($key) = @_;
+    return ok_response(encode_json({ schema => { uniqueKey => $key } }));
+}
+
+#
+# 16. A transient 502 on the schema endpoint is retried, not fatal.
+#
+{
+    my($api, $ua) = api_with(err_response(502, "Bad Gateway", "error code: 502"),
+                             schema_response("genome_id"));
+    my $key = $api->_unique_key_for_core("genome");
+    is($ua->attempts, 2, "_unique_key_for_core retries a 502");
+    is($key, "genome_id", "  ... and returns the discovered key");
+}
+
+#
+# 17. The result is memoized, so a paging loop costs one request no matter how
+#     many pages it walks.
+#
+{
+    my($api, $ua) = api_with(schema_response("feature_id"));
+    is($api->_unique_key_for_core("genome_feature"), "feature_id", "first lookup fetches");
+    is($api->_unique_key_for_core("genome_feature"), "feature_id", "second lookup is cached");
+    is($ua->attempts, 1, "  ... with only one request made");
+}
+
+#
+# 18. Staying unreachable for the whole budget is still fatal. The plan's
+#     requirement is to fail out rather than quietly resume deep paging, and
+#     retrying must not soften that into a silent fallback.
+#
+#     A UA that never stops failing, rather than a scripted queue: the number of
+#     attempts inside the budget is a function of jittered backoff and so is not
+#     fixed, and a queue that runs dry would report as its own error.
+{
+    package AlwaysFailsUA;
+    sub new { return bless { sent => 0 }, shift }
+    sub request
+    {
+        my($self) = @_;
+        $self->{sent}++;
+        return HTTP::Response->new(502, "Bad Gateway", HTTP::Headers->new(), "");
+    }
+    sub attempts { return $_[0]->{sent} }
+}
+{
+    local $ENV{P3_HTTP_RETRY_MAX_ELAPSED} = 0.05;
+    my $api = P3DataAPI->new("http://example.invalid/api", "dummy-token");
+    my $ua = AlwaysFailsUA->new;
+    $api->{ua} = $ua;
+
+    eval { $api->_unique_key_for_core("genome") };
+    like($@, qr/cannot determine the uniqueKey for core 'genome'/,
+         "_unique_key_for_core dies when the endpoint stays down");
+    like($@, qr/silently duplicated and dropped rows/, "  ... explaining why that is fatal");
+    cmp_ok($ua->attempts, '>', 1, "  ... having actually retried first");
+}
+
+#
+# 19. A 400 means this core has no schema endpoint; asking again cannot change
+#     that, so it fails on the first attempt.
+#
+{
+    my($api, $ua) = api_with(err_response(400, "Bad Request", ""));
+    eval { $api->_unique_key_for_core("nosuchcore") };
+    like($@, qr/cannot determine the uniqueKey/, "a 400 is fatal");
+    is($ua->attempts, 1, "  ... without retrying");
+}
+
+#
+# 20. A reachable core that reports no uniqueKey is a different failure from an
+#     unreachable one, and says so.
+#
+{
+    my($api, $ua) = api_with(ok_response(encode_json({ schema => {} })));
+    eval { $api->_unique_key_for_core("genome") };
+    like($@, qr/reports no uniqueKey/, "a schema without a uniqueKey is fatal");
+    is($ua->attempts, 1, "  ... and is not retried, since the answer will not change");
+}
+
 done_testing();

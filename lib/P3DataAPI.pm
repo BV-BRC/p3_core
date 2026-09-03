@@ -609,6 +609,18 @@ sub _cursor_enabled
 # Memoized per core on the object, so a paging loop costs at most one extra
 # request.
 #
+# The fetch goes through P3ClientUA::retry_request for the same reason the query
+# paths do, and the case for it here is stronger rather than weaker. This is a
+# prerequisite of every cursor query, so an unretried transient turns a blip on a
+# ~200-byte metadata GET into the failure of whatever the caller was doing: a
+# single 502 here aborted a completed 217-genome BLAST database build
+# (Tectiviridae, 2026-09-02) after all of its real work was done. A GET of a
+# schema is idempotent, so we do not pass idempotent_only -- a MAYBE_SENT
+# response is safe to replay.
+#
+# "Cannot discover the key" therefore means the endpoint stayed unreachable for
+# the whole retry budget, not that one request happened to fail.
+#
 sub _unique_key_for_core
 {
     my($self, $core) = @_;
@@ -617,7 +629,10 @@ sub _unique_key_for_core
     return $cache->{$core} if defined $cache->{$core};
 
     my $url = $self->{url} . "/$core/schema";
-    my $res = $self->ua->get($url, Accept => "application/json");
+    my $res = P3ClientUA::retry_request($self->ua,
+                                        sub { HTTP::Request::Common::GET($url,
+                                                                         Accept => "application/json") },
+                                        what => "schema lookup on $core");
 
     $res->is_success
         or die "P3DataAPI: cannot determine the uniqueKey for core '$core' " .
@@ -757,9 +772,26 @@ sub _page_query
         if ($cursor)
         {
             $next_mark = $resp->header('X-Cursor-Mark');
-            defined($next_mark)
-                or die "P3DataAPI: cursor query to core '$core' returned no " .
-                       "X-Cursor-Mark header; cannot page safely.\n";
+
+            #
+            # A missing mark is only tolerable on a page that has already told
+            # us the result set is exhausted. The deployments disagree here:
+            # www.bv-brc.org returns the mark on every page including the last,
+            # while alpha.bv-brc.org omits it on the final short page (measured
+            # 2026-09-03 -- same query, same 3,356 rows, mark on the full
+            # limit(100) page, no mark on the short limit(25000) one). Demanding
+            # it unconditionally makes every *complete* query die on alpha.
+            #
+            # A full page with no mark stays fatal: there are more rows and no
+            # way to ask for them, and quietly returning a truncated result is
+            # the exact failure this cursor conversion exists to remove.
+            #
+            if (!defined($next_mark) && $ndocs > 0 && $ndocs >= $page)
+            {
+                die "P3DataAPI: cursor query to core '$core' returned a full " .
+                    "page of $ndocs rows with no X-Cursor-Mark header; " .
+                    "cannot page safely.\n";
+            }
         }
 
         #
@@ -772,7 +804,8 @@ sub _page_query
         my $last_call = 0;
         if ($cursor)
         {
-            $last_call = 1 if ($ndocs < $page || $ndocs == 0 || $next_mark eq $mark);
+            $last_call = 1 if ($ndocs < $page || $ndocs == 0
+                               || !defined($next_mark) || $next_mark eq $mark);
         }
         else
         {
@@ -1203,11 +1236,110 @@ Invoke the callback for each one.
 
 =cut
 
+=head3 B<id_list_op>
+
+    my $op = P3DataAPI::id_list_op();
+
+The RQL operator to use for a large literal ID list: C<terms> when
+C<P3_RQL_TERMS> is set in the environment, C<in> otherwise.
+
+C<terms(f,(a,b,c))> is the one we want. It emits C<&fq={!terms f=f}a,b,c>,
+which matches against a hash set and lands in a filter query -- cached, and
+scoring nothing. C<in(f,(a,b,c))> emits C<f:(a OR b OR c)> into C<&q=>: one
+boolean clause per value, so on a few thousand values the clause tree becomes
+the dominant cost of the query and can hit C<maxBooleanClauses>. For an ID
+lookup there is no ranking to lose by moving out of C<&q=>.
+
+B<It defaults to C<in>, for two independent reasons measured 2026-09-03.>
+
+B<1. Production does not implement the operator.>
+
+    www.bv-brc.org/api                 terms -> 400   in -> 200
+    p3.theseed.org/services/data_api   terms -> 400   in -> 200
+    alpha.bv-brc.org/api               terms -> 200   in -> 200
+
+The failure is not a clean "unknown operator" -- Solr answers
+C<{"msg":"undefined field object","code":400}>, because the older parser
+mangles the clause rather than rejecting it. C<www.bv-brc.org/api> is this
+module's default url, so defaulting to C<terms> would break every caller
+against production.
+
+B<2. Where it is implemented, it truncates on C<genome_feature>.> On alpha,
+C<terms> plus a C<limit> of 10,000 or more returns B<HTTP 200 with a one-byte
+body> (C<"[">) whenever the result set is exhausted before the limit -- a
+truncated stream reported as success. Bisected exactly:
+
+    genome_feature  terms  250 ids  limit(9999)   -> 200, 250 rows
+    genome_feature  terms  250 ids  limit(10000)  -> 200, 1 byte, TRUNCATED
+    genome_feature  in     250 ids  limit(25000)  -> 200, 250 rows
+    genome_feature  terms  250 gids limit(25000)  -> 200, 25000 rows   (full page, fine)
+    feature_sequence terms 1489 md5 limit(25000)  -> 200, 1489 rows    (core unaffected)
+
+C<chunk_size> is 25,000, so every paged C<genome_feature> query hits this. The
+one saving grace is that it is not silent through this module: the GET path
+gets a 502 and C<submit_query> dies, rather than a short read being taken for
+an empty result. Do not rely on that -- the POST path really does return a
+successful-looking truncated body.
+
+Verified by call site against alpha, C<in> vs C<terms>, same process:
+
+    retrieve_genome_metadata            30 rows    identical
+    lookup_sequence_data (aa)         1489 rows    identical, 1.95s -> 0.97s
+    lookup_sequence_data (na)         1490 rows    identical, 2.23s -> 1.60s
+    retrieve_ssu_rnas                    0 rows    identical
+    retrieve_protein_feature_sequence          terms died (502 after 300s)
+    retrieve_nucleotide_feature_sequence       terms died (502 after 289s)
+
+So the operator is semantically correct -- the C<feature_sequence> md5 lookup
+that wedged the BLAST build agrees row for row and runs about twice as fast --
+and the two failures are the server bug above, not a semantic difference.
+
+Flip the default here once production serves a C<rql.js> new enough to collect
+the clause (C<lib/solrjs/rql.js:474>) and emit it (C<:108>), B<and> the
+C<genome_feature> truncation is fixed. Re-run C<t/client-tests/p3-rql-terms.t>
+against the target deployment before flipping.
+
+B<Only valid for literal value lists.> Do not route the subquery forms
+(C<in(feature_id,FeatureGroup(/path))>, C<in(genome_id,GenomeGroup(/path))>) or
+wildcard lists (C<in(feature_type,(*rna,*RNA))>) through this -- C<{!terms}>
+does no server-side resolution and no wildcard expansion, and would match
+nothing without erroring.
+
+=cut
+
+sub id_list_op
+{
+    return $ENV{P3_RQL_TERMS} ? 'terms' : 'in';
+}
+
+#
+# A smaller batch than the 5000 this used to send.
+#
+# On 2026-09-03 twelve concurrent BLAST build workers calling this wedged the
+# API tier: the edge returned the bare "error code: 524" to eleven genera inside
+# a three-second window while the web front end kept answering in 113ms, which
+# is the origin spinning rather than eleven independent query timeouts.
+#
+# in(md5,(...)) compiles to field:(v1 OR v2 OR ...) -- one boolean clause per
+# value, in &q=, scored. At 5000 values that clause tree is the dominant cost of
+# the query and it approaches maxBooleanClauses. terms() instead emits
+# &fq={!terms f=md5}v1,v2,... (lib/solrjs/rql.js:474 collects it, :108 emits
+# it), which matches against a hash set and lands in a filter query, so it is
+# cached and scores nothing. An ID lookup wants exactly that: there is no
+# ranking here to lose by moving out of &q=.
+#
+# The batch size stays reduced as well, because terms() fixes the server's side
+# of this and not ours -- an md5 is 32 hex characters plus a comma, so 5000 ids
+# is still a 165,203-byte request body. 500 matches every other chunk in this
+# file (see :1522, "to mitigate Solr timeouts"); 5000 was the outlier. Worth
+# re-benchmarking upward once the API is healthy, now that the clause tree is
+# no longer what makes a large batch expensive.
+#
 sub lookup_sequence_data
 {
     my($self, $ids, $cb) = @_;
 
-    my $batchsize = 5000;
+    my $batchsize = 500;
     my @goodIds = grep { $_ } @$ids;
     my $n = @goodIds;
     my $end;
@@ -1224,7 +1356,7 @@ sub lookup_sequence_data
                             }
                         },
                         ['select', 'sequence,md5,sequence_type'],
-                        ['in', 'md5', '(' . join(",", @goodIds[$i .. $end]) . ')']);
+                        [id_list_op(), 'md5', '(' . join(",", @goodIds[$i .. $end]) . ')']);
     }
 }
 
@@ -1385,6 +1517,14 @@ sub retrieve_patricids_from_feature_group {
 			    #}
 			    return 1;
 			},
+			#
+			# Stays in(). This is the subquery form, not a value
+			# list: the argument is a FeatureGroup(...) reference
+			# the API resolves server-side. terms() takes literal
+			# values only and would send the string "FeatureGroup(
+			# /path)" as a feature_id to match. Same for every
+			# GenomeGroup(...) clause below.
+			#
 			[ "in",     "feature_id", "FeatureGroup(" . uri_escape($feature_group_path) . ")"],
 			['select', 'patric_id,feature_id']
 		       );
@@ -1525,7 +1665,7 @@ sub retrieve_protein_feature_sequence {
                         return 1;
                     },
                     [ "in",     "feature_type", "(mat_peptide,CDS)" ],
-                    [ "in",     $id_field, "(" . join(",", map { uri_escape($_) } @chunk) . ")"],
+                    [ id_list_op(),  $id_field, "(" . join(",", map { uri_escape($_) } @chunk) . ")"],
                     [ "select", "patric_id,aa_sequence_md5" ],
 		       );
     }
@@ -1569,7 +1709,7 @@ sub retrieve_nucleotide_feature_sequence {
                         }
                         return 1;
                     },
-                    [ "in",     $id_field, "(" . join(",", map { uri_escape($_) } @$fids) . ")"],
+                    [ id_list_op(),  $id_field, "(" . join(",", map { uri_escape($_) } @$fids) . ")"],
                     [ "select", "patric_id,na_sequence_md5" ],
                    );
 
@@ -1805,7 +1945,7 @@ sub retrieve_ssu_rnas {
     my $qry;
     if ( ref($genome) ) {
         my $q = join( ",", @$genome );
-        $qry = [ "in", "genome_id", "($q)" ];
+        $qry = [ id_list_op(), "genome_id", "($q)" ];
     } else {
         $qry = [ "eq", "genome_id", $genome ];
     }
@@ -1850,7 +1990,7 @@ sub retrieve_genome_metadata {
     my $qry;
     if ( ref($genomes) ) {
         my $q = join( ",", @$genomes );
-        $qry = [ "in", "genome_id", "($q)" ];
+        $qry = [ id_list_op(), "genome_id", "($q)" ];
     } else {
         $qry = [ "eq", "genome_id", $genomes ];
     }
@@ -1876,7 +2016,7 @@ sub retrieve_private_genome_metadata {
     my $qry;
     if ( ref($genomes) ) {
         my $q = join( ",", @$genomes );
-        $qry = [ "in", "genome_id", "($q)" ];
+        $qry = [ id_list_op(), "genome_id", "($q)" ];
     } else {
         $qry = [ "eq", "genome_id", $genomes ];
     }
@@ -2022,6 +2162,13 @@ sub retrieve_rna_features_in_genomes_to_temp {
             },
                         [ "eq",     "genome_id", $gid ],
                         [ "eq", "patric_id", "*"],
+            #
+            # Stays in(), and not because the list is short: {!terms} matches
+            # literal values against a hash set and does no wildcard expansion,
+            # so terms(feature_type,(*rna,*RNA)) would look for features whose
+            # type is the four-character string "*rna" and quietly return
+            # nothing. Wildcards need the boolean-query path.
+            #
             [ "in", "feature_type", "(*rna,*RNA)"],
                         [ "select", "patric_id,na_sequence_md5" ],
         );
