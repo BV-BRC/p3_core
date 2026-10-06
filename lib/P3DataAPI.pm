@@ -22,6 +22,7 @@ eval {
 };
 
 use HTTP::Request::Common;
+use HTTP::Response;
 use Data::Dumper;
 use P3ClientUA;
 
@@ -605,6 +606,33 @@ sub _cursor_enabled
 }
 
 #
+# A one-line description of what a response actually carried, for an error
+# message. Enough to tell a Cloudflare HTML page from a truncated JSON body from
+# a real schema change without having to reproduce the failure -- which, being a
+# transient, is the one thing the reader cannot do.
+#
+# The snippet is deliberately short and has its whitespace collapsed: this lands
+# in a job's stderr, and a 5 KB schema or an HTML error page pasted whole buries
+# the rest of the diagnostic.
+#
+sub _describe_body
+{
+    my($res) = @_;
+
+    my $body = $res->content // '';
+    my $type = $res->header('Content-Type') // 'no content-type';
+
+    my $snippet = substr($body, 0, 200);
+    $snippet =~ s/\s+/ /g;
+    $snippet =~ s/^\s+|\s+$//g;
+    $snippet .= '...' if length($body) > 200;
+
+    return sprintf("%s, %d bytes, starts: %s",
+                   $type, length($body),
+                   length($snippet) ? "\"$snippet\"" : "(empty)");
+}
+
+#
 # The uniqueKey field for $core, as reported by the data API schema endpoint.
 # Memoized per core on the object, so a paging loop costs at most one extra
 # request.
@@ -621,6 +649,30 @@ sub _cursor_enabled
 # "Cannot discover the key" therefore means the endpoint stayed unreachable for
 # the whole retry budget, not that one request happened to fail.
 #
+# That last sentence was false for the failure this endpoint actually produces,
+# which is a 200 carrying something that is not a schema. classify_response
+# stops at the HTTP envelope and calls every 2xx NO_RETRY, so an empty body, a
+# body truncated mid-object, or an edge's HTML error page all sailed straight
+# through to "core 'x' reports no uniqueKey" on the first attempt -- a confident
+# claim about the schema, made on no evidence, with no retry. It failed a
+# GenomeAnnotation job on core 'taxonomy' (2026-10-05) whose schema has had
+# taxon_id all along.
+#
+# detect_truncated_body does not help here and cannot be made to: it compares
+# against Content-Length, and the API serves this endpoint chunked (verified --
+# LWP sees Transfer-Encoding: chunked and content_length undef), so it returns
+# the response untouched.
+#
+# So judge the body here and, when it is unusable, hand retry_request a
+# synthetic 502 through its `send` hook -- the same move detect_truncated_body
+# makes, for the same reason, and without reaching into P3ClientUA. A bad body
+# is then just another transient and gets the normal backoff budget.
+#
+# The split that matters: a body that does not PARSE is transient, but a body
+# that parses and genuinely lacks a uniqueKey is permanent, and retrying that
+# would burn the whole 300s budget on every call for an answer that will not
+# change. Only the former is made retryable.
+#
 sub _unique_key_for_core
 {
     my($self, $core) = @_;
@@ -629,10 +681,50 @@ sub _unique_key_for_core
     return $cache->{$core} if defined $cache->{$core};
 
     my $url = $self->{url} . "/$core/schema";
+
+    my $doc;            # the decoded schema, set by the last usable response
+    my $why;            # why the last response was unusable, for the message
+
+    my $send = sub {
+        my($ua, $req) = @_;
+        my $res = $ua->request($req);
+        return $res unless $res->is_success;
+
+        my $parsed = eval { decode_json($res->content) };
+        if (!defined($parsed) || ref($parsed) ne 'HASH')
+        {
+            #
+            # JSON::XS appends "at <file> line <n>." -- our own file and line,
+            # which points at the decode call rather than at anything wrong.
+            # In a job's stderr that reads like the bug is here.
+            #
+            my $err = $@;
+            if (defined $err)
+            {
+                $err =~ s/ at \S+ line \d+\.?\s*\z//;
+                $err =~ s/\s+\z//;
+            }
+            $why = (defined($err) && $err ne '')
+                 ? "body is not JSON ($err)"
+                 : "body decoded to " . (ref($parsed) || 'a non-object scalar');
+            $why .= "; " . _describe_body($res);
+
+            my $synth = HTTP::Response->new(502, "Unusable schema response: $why",
+                                            $res->headers->clone);
+            $synth->request($res->request) if $res->request;
+            return $synth;
+        }
+
+        $doc = $parsed;
+        $why = undef;
+        return $res;
+    };
+
     my $res = P3ClientUA::retry_request($self->ua,
                                         sub { HTTP::Request::Common::GET($url,
                                                                          Accept => "application/json") },
-                                        what => "schema lookup on $core");
+                                        what => "schema lookup on $core",
+                                        send => $send);
 
     $res->is_success
         or die "P3DataAPI: cannot determine the uniqueKey for core '$core' " .
@@ -640,13 +732,19 @@ sub _unique_key_for_core
                "a sort tie-breaker, and falling back to deep paging would risk " .
                "silently duplicated and dropped rows.\n";
 
-    my $doc = eval { decode_json($res->content) };
-    my $key = (ref($doc) eq 'HASH') ? $doc->{schema}->{uniqueKey} : undef;
+    my $key = $doc->{schema}->{uniqueKey};
 
+    #
+    # Reached only when the API answered with a well-formed document that has no
+    # uniqueKey in it -- i.e. this really is a statement about the schema, which
+    # is what the message is now entitled to say.
+    #
     $key
         or die "P3DataAPI: core '$core' reports no uniqueKey in its schema at $url. " .
-               "A cursor query needs it as a sort tie-breaker, and falling back to " .
-               "deep paging would risk silently duplicated and dropped rows.\n";
+               "The response parsed as JSON but had no schema.uniqueKey (" .
+               _describe_body($res) . "). A cursor query needs it as a sort " .
+               "tie-breaker, and falling back to deep paging would risk silently " .
+               "duplicated and dropped rows.\n";
 
     return $cache->{$core} = $key;
 }

@@ -344,4 +344,106 @@ sub schema_response
     is($ua->attempts, 1, "  ... and is not retried, since the answer will not change");
 }
 
+#
+# 21. A 200 whose body is not a schema is a transient, not a verdict about the
+#     schema.
+#
+#     Every test above this point feeds the schema path a well-formed body, and
+#     that is how the real bug shipped: classify_response calls any 2xx NO_RETRY,
+#     so a 200 carrying an empty body, a truncated one, or an edge's HTML error
+#     page went straight to "core 'x' reports no uniqueKey" on the first attempt
+#     -- a confident statement about the schema, made from a body that never
+#     contained one. It failed a GenomeAnnotation job on core 'taxonomy'
+#     (2026-10-05) whose schema has had taxon_id throughout.
+#
+#     detect_truncated_body cannot cover this: it needs a Content-Length to
+#     compare against and the API serves this endpoint chunked.
+#
+#     Note test 15 already required exactly this of submit_query. The schema
+#     lookup was inconsistent with its own sibling.
+#
+{
+    my @bad = (
+        ["a truncated body",  '{"schema":{"uniqueKey":"genome_'],
+        ["an empty body",     ''],
+        ["an HTML error page", '<html><body>502 Bad Gateway</body></html>'],
+    );
+
+    for my $c (@bad)
+    {
+        my($what, $body) = @$c;
+        my($api, $ua) = api_with(ok_response($body), schema_response("genome_id"));
+        my $key = eval { $api->_unique_key_for_core("genome") };
+        is($key, "genome_id", "_unique_key_for_core recovers from $what");
+        is($ua->attempts, 2, "  ... by retrying it rather than believing it");
+    }
+}
+
+#
+# A user agent that keeps returning the same response, for the cases where the
+# endpoint never recovers. ScriptedUA dies when its queue empties, which is the
+# right guard for a fixed script but would mask the error under test here: the
+# retry count is driven by the elapsed budget, not by a number we can predict.
+# These blocks bound the budget instead.
+#
+{
+    package RepeatUA;
+    sub new { my($c, $r) = @_; return bless { res => $r, n => 0 }, $c }
+    sub request { my($self) = @_; $self->{n}++; return $self->{res} }
+    sub attempts { return $_[0]->{n} }
+}
+
+sub api_repeating
+{
+    my($res) = @_;
+    my $api = P3DataAPI->new("http://example.invalid/api", "dummy-token");
+    my $ua = RepeatUA->new($res);
+    $api->{ua} = $ua;
+    return ($api, $ua);
+}
+
+#
+# 22. When such a body is all the endpoint ever returns, the failure names what
+#     was actually received instead of blaming the schema.
+#
+{
+    local $P3ClientUA::default_max_elapsed = 0.05;
+    my($api, $ua) = api_repeating(ok_response('<html><body>502 Bad Gateway</body></html>'));
+    eval { $api->_unique_key_for_core("genome") };
+    my $err = $@;
+
+    like($err, qr/cannot determine the uniqueKey/,
+         "an endlessly unusable body reports as undeterminable");
+    unlike($err, qr/reports no uniqueKey/,
+           "  ... and never claims the schema lacks the key");
+    like($err, qr/body is not JSON/, "  ... says the body would not parse");
+    like($err, qr/502 Bad Gateway/, "  ... and quotes what came back");
+    cmp_ok($ua->attempts, '>', 1, "  ... after more than one attempt");
+}
+
+#
+# 23. The evidence in the message distinguishes the cases a reader cannot
+#     reproduce, since by the time anyone looks the transient is gone.
+#
+{
+    local $P3ClientUA::default_max_elapsed = 0.05;
+    my($api, $ua) = api_repeating(ok_response(''));
+    eval { $api->_unique_key_for_core("genome") };
+    like($@, qr/0 bytes/, "an empty body is reported as 0 bytes");
+}
+
+#
+# 24. A well-formed document that genuinely lacks the key keeps the old
+#     behaviour: one attempt, and a message entitled to talk about the schema.
+#     Retrying this would spend the entire elapsed budget on an answer that
+#     cannot change -- the distinction test 21 must not erase.
+#
+{
+    my($api, $ua) = api_with(ok_response(encode_json({ schema => { fields => [] } })));
+    eval { $api->_unique_key_for_core("genome") };
+    like($@, qr/reports no uniqueKey/, "a parsed schema with no uniqueKey still says so");
+    like($@, qr/parsed as JSON/, "  ... and notes that the body was well-formed");
+    is($ua->attempts, 1, "  ... without retrying");
+}
+
 done_testing();
