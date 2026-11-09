@@ -2,6 +2,8 @@
 
 package GenomeTypeObject;
 
+#use Carp::Always;
+
 #
 # This is a SAS component.
 #
