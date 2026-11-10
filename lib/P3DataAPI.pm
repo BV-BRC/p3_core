@@ -1125,6 +1125,53 @@ sub solr_query_raw_list
     return $out;
 }
 
+#
+# How many queries solr_query_raw_multi keeps in flight at once.
+#
+# HTTP::Async defaults to 20. The only caller, genes_in_region_bulk, sends one
+# query per pin member, so a single compare-regions call used to open 20
+# connections to the data API at once. The API reaches Solr through a small
+# shared socket pool (8 per worker), so a handful of concurrent compare-regions
+# users could hold all of it and stall every other query. The 2026-11-10 outage
+# was that failure mode, triggered by a crawler instead.
+#
+# P3_DATA_API_ASYNC_SLOTS in the environment, else
+# $FIG_Config::p3_data_api_async_slots, else 2.
+#
+our $default_async_slots = 2;
+
+sub async_slots
+{
+    no warnings 'once';
+    for my $v ($ENV{P3_DATA_API_ASYNC_SLOTS}, $FIG_Config::p3_data_api_async_slots)
+    {
+        next unless defined($v) && $v =~ /\S/;
+        return int($v) if $v =~ /^\s*\d+\s*$/ && $v > 0;
+        warn "Ignoring invalid async slot count '$v'; using $default_async_slots\n";
+        last;
+    }
+    return $default_async_slots;
+}
+
+#
+# Run a list of [core, params] solr queries in parallel and return the docs
+# for each, in order.
+#
+# A query that fails in the parallel pass is not dropped. Before this, a failure
+# only printed a warning and left that slot undef, so a region silently went
+# missing from compare regions. Now:
+#
+#   - A transient failure (connect error, 429, 502/503/504, or a 200 whose body
+#     does not decode) is rerun through _solr_post, which carries the same retry
+#     policy as every other query path and dies if the query still fails.
+#
+#   - A permanent failure (e.g. a 400 for a malformed query, or a Cloudflare
+#     policy block) dies at once; sending it again cannot change the answer.
+#
+# The requests carry the P3ClientUA agent. HTTP::Async sends over Net::HTTP,
+# not LWP, so without the explicit header they went out with no User-Agent at
+# all, which a bvbrc-* allowlist at Cloudflare would refuse.
+#
 sub solr_query_raw_multi
 {
     my($self, $queries) = @_;
@@ -1132,93 +1179,96 @@ sub solr_query_raw_multi
     $have_async or die "HTTP::Async not available";
 
     my $async = HTTP::Async->new();
+    $async->slots($self->async_slots);
+
+    my @params_for;
     my %resmap;
     for my $i (0..$#$queries)
     {
         my $qry = $queries->[$i];
         my($core, $params) = @$qry;
 
-        my $uri = URI->new($self->url . "/$core");
-
         my @params = (start => 0, rows => 25000);
-    if (ref($params) eq 'ARRAY')
-    {
-        for my $ent (@$params)
+        if (ref($params) eq 'ARRAY')
         {
-        my($k, $v) = @$ent;
-        if (ref($v) eq 'ARRAY')
-        {
-            $v = join(",", @$v);
-        }
-        push(@params, $k, $v);
-        }
-    }
-    else
-    {
-        while (my($k, $v) = each %$params)
-        {
-        if (ref($v) eq 'ARRAY')
-        {
-            $v = join(",", @$v);
-        }
-        push(@params, $k, $v);
-        }
-    }
-
-    # print Dumper(PARAMS => @params);
-        $uri->query_form(\@params);
-
-    # print STDERR "Query url: $uri\n";
-
-        my $req = POST($self->url . "/$core",
-                  "Content-type" => "application/solrquery+x-www-form-urlencoded",
-                  "Accept", "application/solr+json",
-                  $self->auth_header,
-                  "Content" => $uri->query);
-
-        my $id = $async->add($req);
-        $resmap{$id} = $i;
-
-        # my $res = $self->ua->get($uri,
-        # 			 "Content-type" => "application/solrquery+x-www-form-urlencoded",
-        # 			 "Accept", "application/solr+json",
-        # 			 $self->auth_header,
-        # 			);
-    }
-
-    my @out;
-    while ($async->not_empty)
-    {
-        my($res,$id) = $async->wait_for_next_response();
-
-        my $n = $resmap{$id};
-        # print STDERR "Response $id (orig $n) returns\n";
-
-        if ($res->is_success)
-        {
-            my $doc = decode_json($res->content);
-            # print Dumper($res,$doc);
-
-            if (ref($doc) eq 'HASH')
+            for my $ent (@$params)
             {
-                my $resp = $doc->{response};
-                my $ndocs = @{$resp->{docs}};
-
-                $out[$n] = $resp->{docs};
-            }
-            else
-            {
-                $out[$n] = [];
-                print STDERR "Empty response for $n: " . Dumper($doc) . "\n";
+                my($k, $v) = @$ent;
+                if (ref($v) eq 'ARRAY')
+                {
+                    $v = join(",", @$v);
+                }
+                push(@params, $k, $v);
             }
         }
         else
         {
-            no warnings 'once';
-            warn "Query failed: " . $res->code . " " . $res->content . "\n" . "error=$Net::HTTPS::NB::HTTPS_ERROR\n";
+            while (my($k, $v) = each %$params)
+            {
+                if (ref($v) eq 'ARRAY')
+                {
+                    $v = join(",", @$v);
+                }
+                push(@params, $k, $v);
+            }
         }
+        $params_for[$i] = \@params;
+
+        my $uri = URI->new($self->url . "/$core");
+        $uri->query_form(\@params);
+
+        my $req = POST($self->url . "/$core",
+                       "Content-type" => "application/solrquery+x-www-form-urlencoded",
+                       "Accept", "application/solr+json",
+                       "User-Agent" => P3ClientUA::user_agent_string(),
+                       $self->auth_header,
+                       "Content" => $uri->query);
+
+        my $id = $async->add($req);
+        $resmap{$id} = $i;
     }
+
+    my @out;
+    my @rerun;
+    while ($async->not_empty)
+    {
+        my($res, $id) = $async->wait_for_next_response();
+        my $n = $resmap{$id};
+
+        if ($res->is_success)
+        {
+            my $doc = eval { decode_json($res->content) };
+            if (defined($doc))
+            {
+                $out[$n] = _multi_docs($doc, $n);
+                next;
+            }
+        }
+        elsif (P3ClientUA::classify_response($res) eq P3ClientUA::NO_RETRY)
+        {
+            P3ClientUA::dump_http_failure($res, \*STDERR) if P3ClientUA::debug_enabled();
+            die P3ClientUA::http_failure_message($res, "Query") if P3ClientUA::is_cloudflare_block($res);
+            die "Query failed: " . $res->code . " " . $res->content . "\n";
+        }
+        push(@rerun, $n);
+    }
+
+    for my $n (@rerun)
+    {
+        my $core = $queries->[$n]->[0];
+        my $doc = $self->_solr_post($core, $params_for[$n], "solr query on $core (rerun of parallel query $n)");
+        $out[$n] = _multi_docs($doc, $n);
+    }
+
     return @out;
+}
+
+sub _multi_docs
+{
+    my($doc, $n) = @_;
+    return $doc->{response}->{docs} if ref($doc) eq 'HASH';
+    print STDERR "Empty response for $n: " . Dumper($doc) . "\n";
+    return [];
 }
 
 #
