@@ -84,6 +84,7 @@ our %family_field_of_type = (plfam => "plfam_id",
                              pgfam => "pgfam_id",
                              figfam => "figfam_id",
                              fig => "figfam_id",
+			     sog => "sog_id",
                              );
 
 our %sql_fam_to_family_type = (L => "plfam",
