@@ -84,6 +84,7 @@ our %family_field_of_type = (plfam => "plfam_id",
                              pgfam => "pgfam_id",
                              figfam => "figfam_id",
                              fig => "figfam_id",
+			     sog => "sog_id",
                              );
 
 our %sql_fam_to_family_type = (L => "plfam",
@@ -3292,21 +3293,7 @@ sub get_pin_p3
         # Need to look up stats of this peg for future analysis. Otherwise members_of_family
         # would do it.
         #
-
-        my $q = "patric_id:$fid";
-        my $res = $self->solr_query("genome_feature",
-                                { q => $q, fl => "patric_id,aa_sequence_md5,accession,start,end,genome_id,genome_name,strand" });
-        #
-        # need to rewrite start/end for neg strand
-        #
-        for my $ent (@$res)
-        {
-            if ($ent->{strand} eq '-')
-            {
-                ($ent->{start}, $ent->{end}) = ($ent->{end}, $ent->{start});
-            }
-        }
-        return ($res->[0]);
+        return ($self->_pin_feature($fid));
     }
 
     print STDERR "Got fam $fam\n";
@@ -3325,7 +3312,38 @@ sub get_pin_p3
             push(@cut_pin, $r);
         }
     }
+
+    #
+    # members_of_family asks for relevance order so the focus feature, which
+    # matches both clauses of its query, comes back first. Don't depend on it:
+    # if the feature is missing from a large family's list, fetch it directly.
+    #
+    $me //= $self->_pin_feature($fid);
+
     return($me, @cut_pin);
+}
+
+#
+# The pin's own row: location and sequence md5 for $fid, with start/end swapped
+# on the minus strand as members_of_family does. Dies if the feature cannot be
+# found; carrying on with an empty row only fails later, as a Solr syntax error
+# on an empty genome_id.
+#
+sub _pin_feature
+{
+    my($self, $fid) = @_;
+
+    my $res = $self->solr_query("genome_feature",
+                                { q => "patric_id:\"$fid\"",
+                                  fl => "patric_id,aa_sequence_md5,accession,start,end,genome_id,genome_name,strand" });
+    my $ent = $res->[0];
+    $ent or die "Compare regions: feature $fid was not found (a private genome without a token?)\n";
+
+    if ($ent->{strand} eq '-')
+    {
+        ($ent->{start}, $ent->{end}) = ($ent->{end}, $ent->{start});
+    }
+    return $ent;
 }
 
 sub get_pin_from_features
@@ -3972,6 +3990,13 @@ sub members_of_family
 
     my @q;
     push(@q, q => "$fam_field:$fam OR patric_id:$fid");
+    #
+    # Rank by relevance so $fid, which matches both clauses, comes first and
+    # survives the $max_count cut. Without an explicit sort, cursor paging orders
+    # by feature_id, and in a family of more than $max_count members the focus
+    # feature is usually not among the first $max_count.
+    #
+    push(@q, sort => "score desc");
     if ($solr_filter)
     {
     push(@q, fq => $solr_filter . "," . genome_of($fid));
